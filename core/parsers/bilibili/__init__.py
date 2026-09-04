@@ -19,6 +19,7 @@ from ..base import (
     handle,
 )
 from .login import BilibiliLogin
+from .video import AIConclusion, VideoInfo
 
 try:
     select_client("curl_cffi")
@@ -142,8 +143,6 @@ class BilibiliParser(BaseParser):
             avid (int | None): avid
             page_num (int): 页码
         """
-
-        from .video import AIConclusion, VideoInfo
 
         video = await self._get_video(bvid=bvid, avid=avid)
         # 转换为 msgspec struct

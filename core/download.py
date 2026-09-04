@@ -2,6 +2,7 @@ from asyncio import Task, TimeoutError, create_task, gather, sleep, to_thread
 from collections.abc import Callable, Coroutine
 from functools import wraps
 from pathlib import Path
+from sys import stderr
 from typing import Any, ParamSpec, TypeVar
 
 import aiofiles
@@ -169,6 +170,7 @@ class Downloader:
             dynamic_ncols=True,
             colour="green",
             desc=desc,
+            disable=not stderr.isatty(),
         )
 
     @auto_task

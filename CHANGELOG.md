@@ -5,6 +5,11 @@
 - 新增引用解析开关
 - 新增 allcpp 解析器
 - 修复更新插件时字体占用导致无法更新的问题
+- 修复 NapCat 合并转发本地视频时 `realpath ENOENT` 导致发送失败的问题
+- 修复 NapCat 要求 video 必须单独成条时，卡片图与视频同发失败的问题
+- 修复 AstrBot 容器与 Windows NapCat 不共享本地路径时，视频 `realpath ENOENT` 的问题（改为文件服务 HTTP 地址）
+- 避免 B 站解析在 pip 安装依赖期间延迟导入模型
+- Docker 等非 TTY 环境关闭下载进度条，避免刷屏日志
 
 ## v1.5.6
 

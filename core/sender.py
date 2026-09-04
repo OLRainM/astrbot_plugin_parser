@@ -60,17 +60,60 @@ class MessageSender:
             path = path.resolve()
         return path.as_uri()
 
+    def _callback_api_base(self) -> str:
+        """
+        NapCat 在宿主机、AstrBot 在容器时，本地 path / file URI
+        对协议端不可见。应改走 AstrBot 文件服务 HTTP 地址。
+        """
+        context = getattr(self.cfg, "context", None)
+        cfg = context.get_config() if context else {}
+        try:
+            base = str(cfg.get("callback_api_base") or "").strip().rstrip("/")
+        except Exception:
+            base = ""
+        if base:
+            return base
+
+        port = 6185
+        try:
+            dashboard = cfg.get("dashboard") or {}
+            port = int(dashboard.get("port") or port)
+        except Exception:
+            pass
+        return f"http://127.0.0.1:{port}"
+
+    async def _register_file_url(self, path: Path) -> str | None:
+        try:
+            from astrbot.core import file_token_service
+        except Exception:
+            return None
+
+        local = str(path if path.is_absolute() else path.resolve())
+        try:
+            token = await file_token_service.register_file(local)
+        except Exception as exc:
+            logger.warning(f"注册文件服务失败，将回退本地路径：{exc}")
+            return None
+
+        return f"{self._callback_api_base()}/api/file/{token}"
+
     @staticmethod
     def _image_from_path(path: Path) -> Image:
         return Image.fromFileSystem(str(path))
 
-    @staticmethod
-    def _video_from_path(path: Path) -> Video:
+    async def _video_from_path(self, path: Path) -> Video:
+        if url := await self._register_file_url(path):
+            return Video.fromURL(url)
         return Video.fromFileSystem(str(path))
 
     @staticmethod
     def _record_from_path(path: Path) -> Record:
         return Record.fromFileSystem(str(path))
+
+    async def _file_from_path(self, path: Path) -> File:
+        if url := await self._register_file_url(path):
+            return File(name=path.name, url=url)
+        return File(name=path.name, file=self._to_file_uri(path))
 
     @staticmethod
     def _iter_contents(result: ParseResult):
@@ -211,17 +254,37 @@ class MessageSender:
 
             match cont:
                 case VideoContent() | DynamicContent():
-                    segs.append(self._video_from_path(path))
+                    segs.append(await self._video_from_path(path))
                 case AudioContent():
                     segs.append(
-                        File(name=path.name, file=self._to_file_uri(path))
+                        await self._file_from_path(path)
                         if self.cfg.audio_to_file
                         else self._record_from_path(path)
                     )
                 case FileContent():
-                    segs.append(File(name=path.name, file=self._to_file_uri(path)))
+                    segs.append(await self._file_from_path(path))
 
         return segs
+
+    @staticmethod
+    def _partition_merge_segments(
+        segs: list[BaseMessageComponent],
+    ) -> tuple[list[BaseMessageComponent], list[BaseMessageComponent]]:
+        """
+        拆出不能放进合并转发的消息段。
+
+        NapCat 合并转发会走 Node.to_dict() -> Video.toDict()，把 Windows
+        本地 path 一并提交；协议端再 realpath 时会 ENOENT。视频必须走
+        独立发送，使用 Video.to_dict()（file URI / 回调 URL）。
+        """
+        mergeable: list[BaseMessageComponent] = []
+        standalone: list[BaseMessageComponent] = []
+        for seg in segs:
+            if isinstance(seg, Video):
+                standalone.append(seg)
+            else:
+                mergeable.append(seg)
+        return mergeable, standalone
 
     def _merge_segments_if_needed(
         self,
@@ -235,17 +298,44 @@ class MessageSender:
         合并后的消息结构：
         - 每个原始消息段成为一个 Node
         - 统一使用机器人自身身份
+        - 视频单独发送，不进入转发节点
         """
         if not force_merge or not segs:
             return segs
 
+        mergeable, standalone = self._partition_merge_segments(segs)
+        if len(mergeable) < self.cfg.forward_threshold:
+            return [*mergeable, *standalone]
+
         nodes = Nodes([])
         self_id = event.get_self_id()
 
-        for seg in segs:
+        for seg in mergeable:
             nodes.nodes.append(Node(uin=self_id, name="解析器", content=[seg]))
 
-        return [nodes]
+        return [nodes, *standalone]
+
+    @staticmethod
+    def _split_send_batches(
+        segs: list[BaseMessageComponent],
+    ) -> list[list[BaseMessageComponent]]:
+        """
+        NapCat 要求 video 必须是消息里的唯一段。
+        卡片、文本、转发节点可以同条发送；每个视频单独成条。
+        """
+        batches: list[list[BaseMessageComponent]] = []
+        current: list[BaseMessageComponent] = []
+        for seg in segs:
+            if isinstance(seg, Video):
+                if current:
+                    batches.append(current)
+                    current = []
+                batches.append([seg])
+            else:
+                current.append(seg)
+        if current:
+            batches.append(current)
+        return batches
 
     @staticmethod
     def _build_text_fallback(result: ParseResult) -> list[BaseMessageComponent]:
@@ -286,13 +376,15 @@ class MessageSender:
         if not segs:
             return False
 
-        try:
-            await event.send(event.chain_result(segs))
-            return True
-        except Exception as e:
-            seg_meta = self._collect_seg_meta(segs)
-            logger.error(f"发送解析结果失败： error={e}, segments={seg_meta}")
-            return False
+        sent = False
+        for batch in self._split_send_batches(segs):
+            try:
+                await event.send(event.chain_result(batch))
+                sent = True
+            except Exception as e:
+                seg_meta = self._collect_seg_meta(batch)
+                logger.error(f"发送解析结果失败： error={e}, segments={seg_meta}")
+        return sent
 
     @staticmethod
     def _collect_seg_meta(segs: list[BaseMessageComponent]) -> list[dict[str, str]]:
